@@ -29,7 +29,9 @@ module Runtime = struct
   let read = Awskit_lwt_unix.Runtime.read
   let with_download_body = Awskit_lwt_unix.Runtime.with_download_body
   let discard_download_body = Awskit_lwt_unix.Runtime.discard_download_body
-  let call t request body = Awskit_lwt_unix.Runtime.call t.aws request body
+
+  let with_response t request body ~f =
+    Awskit_lwt_unix.Runtime.with_response t.aws request body ~f
 end
 
 module S3 = Awskit_s3.Make (Runtime)

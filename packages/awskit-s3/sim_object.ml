@@ -68,37 +68,43 @@ module Object = struct
                             options.preconditions
                         with
                         | Error error -> Error error
-                        | Ok () ->
-                            let etag = etag body in
-                            let checksum =
-                              checksum_for_body ~body options.checksum
-                            in
-                            let obj =
-                              {
-                                body;
-                                etag;
-                                version_id = None;
-                                content_type = options.content_type;
-                                metadata = options.metadata;
-                                storage_class = options.storage_class;
-                                tags = options.tags;
-                                checksum;
-                                last_modified = now conn;
-                              }
-                            in
-                            let obj = store_object conn bucket_state key obj in
-                            Ok
-                              {
-                                Object.Put.etag = Some etag;
-                                version_id = obj.version_id;
-                                checksum;
-                                request =
-                                  response 200
-                                    ~headers:
-                                      (("etag", etag)
-                                      :: (version_headers obj.version_id
-                                         @ checksum_response_headers checksum));
-                              })))))
+                        | Ok () -> (
+                            match Runtime.upload_body_result body with
+                            | Error error -> Error error
+                            | Ok body ->
+                                let etag = etag body in
+                                let checksum =
+                                  checksum_for_body ~body options.checksum
+                                in
+                                let obj =
+                                  {
+                                    body;
+                                    etag;
+                                    version_id = None;
+                                    content_type = options.content_type;
+                                    metadata = options.metadata;
+                                    storage_class = options.storage_class;
+                                    tags = options.tags;
+                                    checksum;
+                                    last_modified = now conn;
+                                  }
+                                in
+                                let obj =
+                                  store_object conn bucket_state key obj
+                                in
+                                Ok
+                                  {
+                                    Object.Put.etag = Some etag;
+                                    version_id = obj.version_id;
+                                    checksum;
+                                    request =
+                                      response 200
+                                        ~headers:
+                                          (("etag", etag)
+                                          :: (version_headers obj.version_id
+                                             @ checksum_response_headers
+                                                 checksum));
+                                  }))))))
 
   let get conn ~bucket ~key ?options ~consume () =
     let options = Option.value ~default:Object.Get.default_options options in
@@ -844,10 +850,10 @@ module Object = struct
 
   module Buffer = struct
     let put_string conn ~bucket ~key ?options body =
-      put conn ~bucket ~key ?options ~body ()
+      put conn ~bucket ~key ?options ~body:(Runtime.string_body body) ()
 
     let put_bytes conn ~bucket ~key ?options body =
-      put conn ~bucket ~key ?options ~body:(Bytes.to_string body) ()
+      put conn ~bucket ~key ?options ~body:(Runtime.bytes_body body) ()
 
     let consume_string ~max_size reader =
       let chunk = Bytes.create 8192 in

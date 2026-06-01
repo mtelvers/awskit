@@ -491,9 +491,18 @@ module Runtime = struct
   let return x = x
   let bind x f = f x
 
-  type upload_body = string
+  type upload_body = {
+    descriptor : Awskit.Body.Upload.descriptor;
+    body : (string, Awskit.Error.t) result;
+  }
+
   type download_body = { body : string; read_fault : Awskit.Error.t option }
-  type upload_writer = Buffer.t
+
+  type upload_writer = {
+    buffer : Buffer.t;
+    remaining : int64 option ref;
+    mutable write_error : Awskit.Error.t option;
+  }
 
   type download_reader = {
     body : string;
@@ -508,15 +517,8 @@ module Runtime = struct
   let retry_policy _ = Awskit.Retry.default
   let sleep t span = Clock.advance t.store.clock span
   let s3_endpoint_config _ = default_endpoint_config
-  let empty_body = ""
-  let string_body value = value
-  let bytes_body value = Bytes.to_string value
 
-  let stream_body _descriptor ~write =
-    let buffer = Buffer.create 1024 in
-    match write buffer with Ok () -> Buffer.contents buffer | Error _ -> ""
-
-  let upload_descriptor body =
+  let descriptor_for_string body =
     {
       Awskit.Body.Upload.content_length =
         Some (Int64.of_int (String.length body));
@@ -524,9 +526,65 @@ module Runtime = struct
       replayable = true;
     }
 
+  let empty_body = { descriptor = descriptor_for_string ""; body = Ok "" }
+
+  let string_body value =
+    { descriptor = descriptor_for_string value; body = Ok value }
+
+  let bytes_body value = string_body (Bytes.to_string value)
+  let body_error message = Awskit.Error.body message
+
+  let writer_for descriptor =
+    {
+      buffer = Buffer.create 1024;
+      remaining = ref descriptor.Awskit.Body.Upload.content_length;
+      write_error = None;
+    }
+
+  let check_write_length writer value =
+    match !(writer.remaining) with
+    | None -> Ok ()
+    | Some remaining ->
+        let length = Int64.of_int (String.length value) in
+        if Stdlib.Int64.compare length remaining > 0 then
+          Error (body_error "upload body exceeded declared content_length")
+        else (
+          writer.remaining := Some (Stdlib.Int64.sub remaining length);
+          Ok ())
+
+  let check_finished_length writer =
+    match writer.write_error with
+    | Some error -> Error error
+    | None -> (
+        match !(writer.remaining) with
+        | None | Some 0L -> Ok (Buffer.contents writer.buffer)
+        | Some _ ->
+            Error
+              (body_error "upload body ended before declared content_length"))
+
+  let stream_body descriptor ~write =
+    let writer = writer_for descriptor in
+    let body =
+      match write writer with
+      | Ok () -> check_finished_length writer
+      | Error _ as error -> error
+    in
+    { descriptor; body }
+
+  let upload_descriptor (body : upload_body) = body.descriptor
+  let upload_body_result (body : upload_body) = body.body
+
   let write_string writer value =
-    Buffer.add_string writer value;
-    Ok ()
+    match writer.write_error with
+    | Some error -> Error error
+    | None -> (
+        match check_write_length writer value with
+        | Error error ->
+            writer.write_error <- Some error;
+            Error error
+        | Ok () ->
+            Buffer.add_string writer.buffer value;
+            Ok ())
 
   let read (reader : download_reader) bytes ~off ~len =
     match reader.read_fault with
@@ -570,10 +628,10 @@ module Runtime = struct
   let discard_download_body body =
     with_download_body body ~consume:(fun reader -> discard_reader reader)
 
-  let call _ _ _ =
+  let with_response _ _ _ ~f:_ =
     Error
       (Awskit.Error.transport ~retryable:false
-         "Sim.Runtime.call is not an HTTP transport")
+         "Sim.Runtime.with_response is not an HTTP transport")
 end
 
 type object_meta = {

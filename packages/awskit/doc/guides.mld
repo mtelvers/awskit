@@ -167,8 +167,9 @@ behavior itself.
 The runtime abstraction keeps HTTP metadata separate from bodies:
 
 {ul
-  {li upload bodies are passed separately to [Runtime.call]}
-  {li download bodies are scoped through [Runtime.with_download_body]}
+  {li upload bodies are passed separately to [Runtime.with_response]}
+  {li response bodies are valid inside the [with_response] callback}
+  {li download body readers are scoped through [Runtime.with_download_body]}
   {li request and response records are body-free}
 }
 
@@ -185,15 +186,31 @@ Uploads carry a descriptor:
 }
 ]}
 
-Downloads must be consumed inside [with_download_body]:
+The descriptor records the declared upload length, the payload hash used for
+signing, and whether the body can be replayed. Service packages may reject
+unknown lengths. For example, S3 [PutObject] and [UploadPart] currently require
+a known [content_length]; Awskit does not implement SigV4 aws-chunked streaming
+for unknown-length uploads.
+
+For custom [stream_body] uploads, the producer callback is part of the upload
+operation. Errors returned by that callback are upload failures. When a known
+length is declared, the producer must emit exactly that number of bytes; prefer
+[string_body] or [bytes_body] when data is already buffered. Mark a custom
+stream [replayable] only if a retry can recreate the same body.
+
+Downloads must be consumed inside the [with_response] callback, normally
+through [with_download_body]:
 
 {[
-Runtime.with_download_body body ~consume:(fun reader ->
-  Runtime.read reader bytes ~off:0 ~len:(Bytes.length bytes))
+Runtime.with_response conn request body ~f:(fun response body ->
+  Runtime.with_download_body body ~consume:(fun reader ->
+    Runtime.read reader bytes ~off:0 ~len:(Bytes.length bytes)))
 ]}
 
 Service packages expose higher-level helpers when buffering is intentional.
-For example, [awskit-s3] uses [Object.Buffer.get_string ~max_size].
+For example, [awskit-s3] uses [Object.Buffer.get_string ~max_size]. These
+helpers keep response-size limits explicit when buffering or draining a
+streaming response.
 
 {1 Choosing An Adapter}
 
@@ -250,8 +267,8 @@ or HTTP stack. The service package functors need:
   {li connection region, credentials, clock, and optional endpoint}
   {li upload-body constructors and upload descriptors}
   {li download-body scoped consumption}
-  {li HTTP transport through [call]}
+  {li HTTP transport through [with_response]}
 }
 
-S3 adapters extend the core runtime with [s3_provider] so S3 endpoint
+S3 adapters extend the core runtime with [s3_endpoint_config] so S3 endpoint
 resolution can stay AWS-aware without putting S3 concepts into the pure core.

@@ -44,9 +44,10 @@ module type S = sig
 
   val discard_download_body : download_body -> (unit, Error.t) result t
 
-  val call :
+  val with_response :
     connection ->
     Request.t ->
     upload_body ->
-    (Response.t * download_body, Error.t) result t
+    f:(Response.t -> download_body -> ('a, Error.t) result t) ->
+    ('a, Error.t) result t
 end

@@ -257,7 +257,7 @@ module Recording_runtime = struct
   type call = { request : Awskit.Request.t; body : string }
 
   type upload_body = {
-    body : string;
+    body : (string, Awskit.Error.t) result;
     descriptor : Awskit.Body.Upload.descriptor;
   }
 
@@ -322,7 +322,7 @@ module Recording_runtime = struct
     }
 
   let upload_body ?replayable body =
-    { body; descriptor = descriptor ?replayable body }
+    { body = Ok body; descriptor = descriptor ?replayable body }
 
   let empty_body = upload_body ""
   let string_body body = upload_body body
@@ -331,7 +331,15 @@ module Recording_runtime = struct
   let stream_body descriptor ~write =
     let buffer = Buffer.create 128 in
     let body =
-      match write buffer with Ok () -> Buffer.contents buffer | Error _ -> ""
+      match write buffer with
+      | Ok () -> (
+          let body = Buffer.contents buffer in
+          let length = Int64.of_int (String.length body) in
+          match descriptor.Awskit.Body.Upload.content_length with
+          | Some declared when not (Stdlib.Int64.equal declared length) ->
+              Error (Awskit.Error.body "upload body length mismatch")
+          | _ -> Ok body)
+      | Error _ as error -> error
     in
     { body; descriptor }
 
@@ -383,19 +391,23 @@ module Recording_runtime = struct
     let result = drain reader in
     result
 
-  let call conn request (body : upload_body) =
-    conn.calls <- { request; body = body.body } :: conn.calls;
-    match conn.responses with
-    | [] -> Error (Awskit.Error.transport ~retryable:false "no canned response")
-    | response :: rest ->
-        conn.responses <- rest;
-        Ok
-          ( Awskit.Response.create_exn ~status:response.status
-              ~headers:response.headers (),
-            {
-              body = response.body;
-              read_error_after = response.read_error_after;
-            } )
+  let with_response conn request (body : upload_body) ~f =
+    match body.body with
+    | Error _ as error -> error
+    | Ok body -> (
+        conn.calls <- { request; body } :: conn.calls;
+        match conn.responses with
+        | [] ->
+            Error (Awskit.Error.transport ~retryable:false "no canned response")
+        | response :: rest ->
+            conn.responses <- rest;
+            f
+              (Awskit.Response.create_exn ~status:response.status
+                 ~headers:response.headers ())
+              {
+                body = response.body;
+                read_error_after = response.read_error_after;
+              })
 end
 
 module Recording_s3 = Awskit_s3.Make (Recording_runtime)
@@ -876,6 +888,29 @@ let test_non_replayable_upload_not_retried () =
   Alcotest.(check int) "attempts" 1 (List.length conn.calls);
   Alcotest.(check int) "sleeps" 0 (List.length conn.sleeps)
 
+let test_runtime_stream_upload_error_propagates () =
+  let descriptor : Awskit.Body.Upload.descriptor =
+    {
+      content_length = Some 4L;
+      payload_hash = Awskit.Body.Payload_hash.unsigned_payload;
+      replayable = false;
+    }
+  in
+  let stream_error = Awskit.Error.body "runtime stream upload failed" in
+  let conn = Recording_runtime.connect [ response 200 "" ] in
+  let body =
+    Recording_runtime.stream_body descriptor ~write:(fun writer ->
+        match Recording_runtime.write_string writer "ab" with
+        | Error _ as error -> error
+        | Ok () -> Error stream_error)
+  in
+  match
+    Recording_s3.Object.put conn ~bucket:"my-bucket" ~key:"file" ~body ()
+  with
+  | Error error when Error.equal error stream_error -> ()
+  | Error error -> Alcotest.failf "unexpected error: %a" Error.pp error
+  | Ok _ -> Alcotest.fail "expected stream upload error"
+
 let test_retry_jitter_bounds () =
   let policy =
     Awskit.Retry.create_exn ~max_attempts:3
@@ -931,6 +966,123 @@ let test_upload_descriptor_validation () =
       Alcotest.failf "unexpected multipart error: %a" Error.pp error
   | Ok _ -> Alcotest.fail "expected multipart descriptor validation failure");
   Alcotest.(check int) "multipart put not called" 0 (List.length conn.calls)
+
+let test_sim_stream_upload_error_propagates () =
+  let credentials =
+    Awskit.Credentials.create_exn ~access_key_id:"AK" ~secret_access_key:"SK" ()
+  in
+  let clock = Sim.Clock.create ~now:test_time () in
+  let store = Sim.create_store ~clock () in
+  let conn = Sim.connect store ~credentials in
+  let bucket = "stream-error-bucket" in
+  ignore (Sim.Bucket.create conn ~bucket () |> ok_or_fail "create bucket");
+  let stream_error = Awskit.Error.body "sim stream upload failed" in
+  let descriptor : Awskit.Body.Upload.descriptor =
+    {
+      content_length = Some 4L;
+      payload_hash = Awskit.Body.Payload_hash.unsigned_payload;
+      replayable = false;
+    }
+  in
+  let body =
+    Sim.Runtime.stream_body descriptor ~write:(fun writer ->
+        match Sim.Runtime.write_string writer "ab" with
+        | Error _ as error -> error
+        | Ok () -> Error stream_error)
+  in
+  (match Sim.Object.put conn ~bucket ~key:"bad" ~body () with
+  | Error error when Awskit.Error.equal error stream_error -> ()
+  | Error error -> Alcotest.failf "unexpected put error: %a" Error.pp error
+  | Ok _ -> Alcotest.fail "expected stream upload error");
+  match Sim.Object.head conn ~bucket ~key:"bad" () with
+  | Error error when Error.is_not_found error -> ()
+  | Error error -> Alcotest.failf "unexpected head error: %a" Error.pp error
+  | Ok _ -> Alcotest.fail "expected stream error object to be absent"
+
+let test_sim_stream_upload_rejects_length_mismatch () =
+  let credentials =
+    Awskit.Credentials.create_exn ~access_key_id:"AK" ~secret_access_key:"SK" ()
+  in
+  let clock = Sim.Clock.create ~now:test_time () in
+  let store = Sim.create_store ~clock () in
+  let conn = Sim.connect store ~credentials in
+  let bucket = "stream-length-bucket" in
+  ignore (Sim.Bucket.create conn ~bucket () |> ok_or_fail "create bucket");
+  let descriptor : Awskit.Body.Upload.descriptor =
+    {
+      content_length = Some 4L;
+      payload_hash = Awskit.Body.Payload_hash.unsigned_payload;
+      replayable = false;
+    }
+  in
+  let short_body =
+    Sim.Runtime.stream_body descriptor ~write:(fun writer ->
+        Sim.Runtime.write_string writer "ab")
+  in
+  (match Sim.Object.put conn ~bucket ~key:"short" ~body:short_body () with
+  | Error (Awskit.Error.Body _) -> ()
+  | Error error ->
+      Alcotest.failf "unexpected short put error: %a" Error.pp error
+  | Ok _ -> Alcotest.fail "expected short upload body error");
+  let long_body =
+    Sim.Runtime.stream_body descriptor ~write:(fun writer ->
+        match Sim.Runtime.write_string writer "abcd" with
+        | Error _ as error -> error
+        | Ok () -> Sim.Runtime.write_string writer "e")
+  in
+  (match Sim.Object.put conn ~bucket ~key:"long" ~body:long_body () with
+  | Error (Awskit.Error.Body _) -> ()
+  | Error error -> Alcotest.failf "unexpected long put error: %a" Error.pp error
+  | Ok _ -> Alcotest.fail "expected long upload body error");
+  (match Sim.Object.head conn ~bucket ~key:"short" () with
+  | Error error when Error.is_not_found error -> ()
+  | Error error ->
+      Alcotest.failf "unexpected short head error: %a" Error.pp error
+  | Ok _ -> Alcotest.fail "expected short body object to be absent");
+  match Sim.Object.head conn ~bucket ~key:"long" () with
+  | Error error when Error.is_not_found error -> ()
+  | Error error ->
+      Alcotest.failf "unexpected long head error: %a" Error.pp error
+  | Ok _ -> Alcotest.fail "expected long body object to be absent"
+
+let test_sim_multipart_upload_part_stream_error_does_not_store_part () =
+  let clock = Sim.Clock.create ~now:test_time () in
+  let store = Sim.create_store ~clock () in
+  let conn = Sim.connect store ~credentials:creds in
+  ignore (Sim.Bucket.create conn ~bucket:"test-bucket" () |> ok_or_fail "bucket");
+  let created =
+    Sim.Multipart.create conn ~bucket:"test-bucket" ~key:"large.bin" ()
+    |> ok_or_fail "create multipart upload"
+  in
+  let upload_id = created.upload.upload_id in
+  let stream_error = Awskit.Error.body "sim multipart stream upload failed" in
+  let descriptor : Awskit.Body.Upload.descriptor =
+    {
+      content_length = Some 4L;
+      payload_hash = Awskit.Body.Payload_hash.unsigned_payload;
+      replayable = false;
+    }
+  in
+  let body =
+    Sim.Runtime.stream_body descriptor ~write:(fun writer ->
+        match Sim.Runtime.write_string writer "ab" with
+        | Error _ as error -> error
+        | Ok () -> Error stream_error)
+  in
+  (match
+     Sim.Multipart.upload_part conn ~bucket:"test-bucket" ~key:"large.bin"
+       ~upload_id ~part_number:1 ~body ()
+   with
+  | Error error when Error.equal error stream_error -> ()
+  | Error error ->
+      Alcotest.failf "unexpected upload part error: %a" Error.pp error
+  | Ok _ -> Alcotest.fail "expected stream upload error");
+  let listed =
+    Sim.Multipart.list_parts conn ~bucket:"test-bucket" ~key:"large.bin"
+      ~upload_id ()
+    |> ok_or_fail "list multipart parts"
+  in
+  Alcotest.(check int) "stored parts" 0 (List.length listed.parts)
 
 let test_download_body_drain_errors () =
   let conn =
@@ -1404,9 +1556,18 @@ let suite =
           test_retry_disabled_policy;
         Alcotest.test_case "non-replayable upload not retried" `Quick
           test_non_replayable_upload_not_retried;
+        Alcotest.test_case "runtime stream upload error propagates" `Quick
+          test_runtime_stream_upload_error_propagates;
         Alcotest.test_case "retry jitter bounds" `Quick test_retry_jitter_bounds;
         Alcotest.test_case "upload descriptor validation" `Quick
           test_upload_descriptor_validation;
+        Alcotest.test_case "sim stream upload error propagates" `Quick
+          test_sim_stream_upload_error_propagates;
+        Alcotest.test_case "sim stream upload rejects length mismatch" `Quick
+          test_sim_stream_upload_rejects_length_mismatch;
+        Alcotest.test_case
+          "sim multipart upload part stream error does not store part" `Quick
+          test_sim_multipart_upload_part_stream_error_does_not_store_part;
         Alcotest.test_case "download body drain errors" `Quick
           test_download_body_drain_errors;
         Alcotest.test_case "malformed xml responses" `Quick

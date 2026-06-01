@@ -29,7 +29,9 @@ module Make (Client : Cohttp_lwt.S.Client) = struct
     let read = Aws.Runtime.read
     let with_download_body = Aws.Runtime.with_download_body
     let discard_download_body = Aws.Runtime.discard_download_body
-    let call t request body = Aws.Runtime.call t.aws request body
+
+    let with_response t request body ~f =
+      Aws.Runtime.with_response t.aws request body ~f
   end
 
   module S3 = Awskit_s3.Make (Runtime)

@@ -57,46 +57,39 @@ module Make (C : Operation_context.S) = struct
                 in
                 match object_request conn ~bucket ~key with
                 | Error error -> return_error error
-                | Ok request -> (
-                    let* result =
-                      call_empty conn ~method_:`POST ~request
-                        ~query:[ ("uploads", []) ]
-                        ~headers
-                    in
-                    match result with
-                    | Error error -> return_error error
-                    | Ok (response, body) -> (
-                        if not (Awskit.Response.is_success response) then
-                          error_response response body
-                        else
-                          let* body =
-                            read_download_body body ~max_size:1_048_576L
-                          in
-                          match body with
-                          | Error error -> return_error error
-                          | Ok body -> (
-                              match
-                                Xml.decode_root body
-                                  ~name:"InitiateMultipartUploadResult"
-                              with
-                              | Error error -> return_error error
-                              | Ok nodes -> (
-                                  match Xml.child_text "UploadId" nodes with
-                                  | None ->
-                                      return_error (decode "missing UploadId")
-                                  | Some upload_id -> (
-                                      match
-                                        Public_multipart.Upload_id.of_string
-                                          upload_id
-                                      with
-                                      | Error error -> return_error error
-                                      | Ok upload_id ->
-                                          return_ok
-                                            {
-                                              Public_multipart.Create.upload =
-                                                { bucket; key; upload_id };
-                                              request = response;
-                                            }))))))))
+                | Ok request ->
+                    with_empty_response conn ~method_:`POST ~request
+                      ~query:[ ("uploads", []) ]
+                      ~headers
+                      ~f:(fun response body ->
+                        let* body =
+                          read_download_body body ~max_size:1_048_576L
+                        in
+                        match body with
+                        | Error error -> return_error error
+                        | Ok body -> (
+                            match
+                              Xml.decode_root body
+                                ~name:"InitiateMultipartUploadResult"
+                            with
+                            | Error error -> return_error error
+                            | Ok nodes -> (
+                                match Xml.child_text "UploadId" nodes with
+                                | None ->
+                                    return_error (decode "missing UploadId")
+                                | Some upload_id -> (
+                                    match
+                                      Public_multipart.Upload_id.of_string
+                                        upload_id
+                                    with
+                                    | Error error -> return_error error
+                                    | Ok upload_id ->
+                                        return_ok
+                                          {
+                                            Public_multipart.Create.upload =
+                                              { bucket; key; upload_id };
+                                            request = response;
+                                          })))))))
 
   let upload_part conn ~bucket ~key ~upload_id ~part_number ~body ?options () =
     let options =
@@ -131,14 +124,10 @@ module Make (C : Operation_context.S) = struct
                     in
                     match object_request conn ~bucket ~key with
                     | Error error -> return_error error
-                    | Ok request -> (
-                        let* result =
-                          call conn ~method_:`PUT ~request ~query ~headers
-                            ~payload_hash:descriptor.payload_hash body
-                        in
-                        match result with
-                        | Error error -> return_error error
-                        | Ok (response, body) -> (
+                    | Ok request ->
+                        with_response conn ~method_:`PUT ~request ~query
+                          ~headers ~payload_hash:descriptor.payload_hash body
+                          ~f:(fun response body ->
                             let* discarded = discard_download_body body in
                             match discarded with
                             | Error error -> return_error error
@@ -161,7 +150,7 @@ module Make (C : Operation_context.S) = struct
                                             checksum =
                                               response_checksum response;
                                             request = response;
-                                          }))))))))
+                                          })))))))
 
   let complete conn ~bucket ~key ~upload_id parts =
     match validate_bucket_key bucket key with
@@ -207,34 +196,27 @@ module Make (C : Operation_context.S) = struct
                 let upload = R.string_body body in
                 match object_request conn ~bucket ~key with
                 | Error error -> return_error error
-                | Ok request -> (
-                    let* result =
-                      call conn ~method_:`POST ~request
-                        ~query:
-                          [
-                            ( "uploadId",
-                              [ Public_multipart.Upload_id.to_string upload_id ]
-                            );
-                          ]
-                        ~headers:[ ("content-type", "application/xml") ]
-                        ~payload_hash:(R.upload_descriptor upload).payload_hash
-                        upload
-                    in
-                    match result with
-                    | Error error -> return_error error
-                    | Ok (response, body) -> (
-                        if not (Awskit.Response.is_success response) then
-                          error_response response body
-                        else
-                          let* body =
-                            read_download_body body ~max_size:1_048_576L
-                          in
-                          match body with
-                          | Error error -> return_error error
-                          | Ok body -> (
-                              match complete_result response body with
-                              | Error error -> return_error error
-                              | Ok result -> return_ok result))))))
+                | Ok request ->
+                    with_response conn ~method_:`POST ~request
+                      ~query:
+                        [
+                          ( "uploadId",
+                            [ Public_multipart.Upload_id.to_string upload_id ]
+                          );
+                        ]
+                      ~headers:[ ("content-type", "application/xml") ]
+                      ~payload_hash:(R.upload_descriptor upload).payload_hash
+                      upload
+                      ~f:(fun response body ->
+                        let* body =
+                          read_download_body body ~max_size:1_048_576L
+                        in
+                        match body with
+                        | Error error -> return_error error
+                        | Ok body -> (
+                            match complete_result response body with
+                            | Error error -> return_error error
+                            | Ok result -> return_ok result)))))
 
   let abort conn ~bucket ~key ~upload_id =
     match validate_bucket_key bucket key with
@@ -242,23 +224,19 @@ module Make (C : Operation_context.S) = struct
     | Ok () -> (
         match object_request conn ~bucket ~key with
         | Error error -> return_error error
-        | Ok request -> (
-            let* result =
-              call_empty conn ~method_:`DELETE ~request
-                ~query:
-                  [
-                    ( "uploadId",
-                      [ Public_multipart.Upload_id.to_string upload_id ] );
-                  ]
-                ~headers:[]
-            in
-            match result with
-            | Error error -> return_error error
-            | Ok (response, body) -> (
+        | Ok request ->
+            with_empty_response conn ~method_:`DELETE ~request
+              ~query:
+                [
+                  ( "uploadId",
+                    [ Public_multipart.Upload_id.to_string upload_id ] );
+                ]
+              ~headers:[]
+              ~f:(fun response body ->
                 let* discarded = discard_download_body body in
                 match discarded with
                 | Error error -> return_error error
-                | Ok () -> return_ok response)))
+                | Ok () -> return_ok response))
 
   let validate_list_parts_options
       (options : Public_multipart.List_parts.options) =
@@ -284,7 +262,7 @@ module Make (C : Operation_context.S) = struct
         | Ok () -> (
             match object_request conn ~bucket ~key with
             | Error error -> return_error error
-            | Ok request -> (
+            | Ok request ->
                 let add name = function
                   | None -> []
                   | Some value -> [ (name, [ string_of_int value ]) ]
@@ -297,74 +275,62 @@ module Make (C : Operation_context.S) = struct
                   @ add "max-parts" options.max_parts
                   @ add "part-number-marker" options.part_number_marker
                 in
-                let* result =
-                  call_empty conn ~method_:`GET ~request ~query ~headers:[]
-                in
-                match result with
-                | Error error -> return_error error
-                | Ok (response, body) -> (
-                    if not (Awskit.Response.is_success response) then
-                      error_response response body
-                    else
-                      let* body =
-                        read_download_body body ~max_size:1_048_576L
-                      in
-                      match body with
-                      | Error error -> return_error error
-                      | Ok body -> (
-                          match
-                            Xml.decode_root body ~name:"ListPartsResult"
-                          with
-                          | Error error -> return_error error
-                          | Ok nodes ->
-                              let parts =
-                                Xml.children "Part" nodes
-                                |> List.filter_map (fun nodes ->
-                                    match
-                                      Option.bind
-                                        (Xml.child_text "PartNumber" nodes)
-                                        int_of_string_opt
-                                    with
-                                    | None -> None
-                                    | Some part_number ->
-                                        Some
-                                          {
-                                            Public_multipart.List_parts
-                                            .part_number;
-                                            etag =
-                                              Option.bind
-                                                (Xml.child_text "ETag" nodes)
-                                                (fun v ->
-                                                  Result.to_option
-                                                    (Public_object.Etag
-                                                     .of_string v));
-                                            size =
-                                              Option.bind
-                                                (Xml.child_text "Size" nodes)
-                                                int64_of_string_opt;
-                                            last_modified =
-                                              Option.bind
-                                                (Xml.child_text "LastModified"
-                                                   nodes)
-                                                ptime_of_string;
-                                            checksum = None;
-                                          })
-                              in
-                              return_ok
-                                {
-                                  Public_multipart.List_parts.parts;
-                                  is_truncated =
-                                    Option.value ~default:false
-                                      (Option.bind
-                                         (Xml.child_text "IsTruncated" nodes)
-                                         parse_bool);
-                                  next_part_number_marker =
+                with_empty_response conn ~method_:`GET ~request ~query
+                  ~headers:[] ~f:(fun response body ->
+                    let* body = read_download_body body ~max_size:1_048_576L in
+                    match body with
+                    | Error error -> return_error error
+                    | Ok body -> (
+                        match Xml.decode_root body ~name:"ListPartsResult" with
+                        | Error error -> return_error error
+                        | Ok nodes ->
+                            let parts =
+                              Xml.children "Part" nodes
+                              |> List.filter_map (fun nodes ->
+                                  match
                                     Option.bind
-                                      (Xml.child_text "NextPartNumberMarker"
-                                         nodes)
-                                      int_of_string_opt;
-                                  request = response;
-                                })))))
+                                      (Xml.child_text "PartNumber" nodes)
+                                      int_of_string_opt
+                                  with
+                                  | None -> None
+                                  | Some part_number ->
+                                      Some
+                                        {
+                                          Public_multipart.List_parts
+                                          .part_number;
+                                          etag =
+                                            Option.bind
+                                              (Xml.child_text "ETag" nodes)
+                                              (fun v ->
+                                                Result.to_option
+                                                  (Public_object.Etag.of_string
+                                                     v));
+                                          size =
+                                            Option.bind
+                                              (Xml.child_text "Size" nodes)
+                                              int64_of_string_opt;
+                                          last_modified =
+                                            Option.bind
+                                              (Xml.child_text "LastModified"
+                                                 nodes)
+                                              ptime_of_string;
+                                          checksum = None;
+                                        })
+                            in
+                            return_ok
+                              {
+                                Public_multipart.List_parts.parts;
+                                is_truncated =
+                                  Option.value ~default:false
+                                    (Option.bind
+                                       (Xml.child_text "IsTruncated" nodes)
+                                       parse_bool);
+                                next_part_number_marker =
+                                  Option.bind
+                                    (Xml.child_text "NextPartNumberMarker" nodes)
+                                    int_of_string_opt;
+                                request = response;
+                              }))))
 
   module Paginator = struct
     let validate_max_pages = function

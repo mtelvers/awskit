@@ -37,10 +37,7 @@ module type S = sig
 
   val discard_download_body : R.download_body -> (unit, Error.t) result io
 
-  val error_response :
-    Awskit.Response.t -> R.download_body -> ('a, Error.t) result io
-
-  val call :
+  val with_response :
     connection ->
     method_:Awskit.Request.Method.t ->
     request:Endpoint_resolver.Request.t ->
@@ -48,15 +45,17 @@ module type S = sig
     headers:(string * string) list ->
     payload_hash:Awskit.Body.Payload_hash.t ->
     upload_body ->
-    (Awskit.Response.t * R.download_body, Error.t) result io
+    f:(Awskit.Response.t -> R.download_body -> ('a, Error.t) result io) ->
+    ('a, Error.t) result io
 
-  val call_empty :
+  val with_empty_response :
     connection ->
     method_:Awskit.Request.Method.t ->
     request:Endpoint_resolver.Request.t ->
     query:(string * string list) list ->
     headers:(string * string) list ->
-    (Awskit.Response.t * R.download_body, Error.t) result io
+    f:(Awskit.Response.t -> R.download_body -> ('a, Error.t) result io) ->
+    ('a, Error.t) result io
 
   val content_md5 : string -> string
 end

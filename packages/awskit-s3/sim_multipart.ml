@@ -67,32 +67,37 @@ module Multipart = struct
                   operation_fault conn `Multipart_upload_part bucket (Some key)
                 with
                 | Some error -> Error error
-                | None ->
-                    let etag = etag body in
-                    let checksum = checksum_for_body ~body options.checksum in
-                    let part =
-                      {
-                        part_number;
-                        body;
-                        etag;
-                        checksum;
-                        last_modified = now conn;
-                      }
-                    in
-                    Hashtbl.replace upload.parts part_number part;
-                    let part =
-                      Public_multipart.Part.create_exn ~part_number ~etag
-                    in
-                    Ok
-                      {
-                        Public_multipart.Upload_part.part;
-                        checksum;
-                        request =
-                          response 200
-                            ~headers:
-                              (("etag", etag)
-                              :: checksum_response_headers checksum);
-                      })))
+                | None -> (
+                    match Runtime.upload_body_result body with
+                    | Error error -> Error error
+                    | Ok body ->
+                        let etag = etag body in
+                        let checksum =
+                          checksum_for_body ~body options.checksum
+                        in
+                        let part =
+                          {
+                            part_number;
+                            body;
+                            etag;
+                            checksum;
+                            last_modified = now conn;
+                          }
+                        in
+                        Hashtbl.replace upload.parts part_number part;
+                        let part =
+                          Public_multipart.Part.create_exn ~part_number ~etag
+                        in
+                        Ok
+                          {
+                            Public_multipart.Upload_part.part;
+                            checksum;
+                            request =
+                              response 200
+                                ~headers:
+                                  (("etag", etag)
+                                  :: checksum_response_headers checksum);
+                          }))))
 
   let validate_complete_parts upload parts =
     let rec loop previous = function
@@ -368,8 +373,8 @@ module Multipart = struct
                       let part_body = String.sub body offset length in
                       match
                         upload_part conn ~bucket ~key ~upload_id ~part_number
-                          ~body:part_body ~options:options.upload_part_options
-                          ()
+                          ~body:(Runtime.string_body part_body)
+                          ~options:options.upload_part_options ()
                       with
                       | Error error -> abort_and_return error
                       | Ok uploaded ->

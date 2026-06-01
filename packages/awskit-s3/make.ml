@@ -129,7 +129,10 @@ module Make (R : RUNTIME) = struct
           retry (attempt + 1)
       | _ -> return_error error
 
-    let call conn ~method_ ~request ~query ~headers ~payload_hash body =
+    type 'a response_action = Done of ('a, Error.t) result | Retry of Error.t
+
+    let with_response conn ~method_ ~request ~query ~headers ~payload_hash body
+        ~f =
       let replayable = (R.upload_descriptor body).replayable in
       let rec attempt attempt_number =
         let* request =
@@ -138,30 +141,35 @@ module Make (R : RUNTIME) = struct
         match request with
         | Error error -> return_error error
         | Ok request -> (
-            let* response = R.call conn request body in
+            let* response =
+              R.with_response conn request body
+                ~f:(fun response response_body ->
+                  if Awskit.Response.is_success response then
+                    let* result = f response response_body in
+                    return_ok (Done result)
+                  else
+                    let* body =
+                      read_download_body response_body ~max_size:1_048_576L
+                    in
+                    match body with
+                    | Error error -> return_ok (Done (Error error))
+                    | Ok body ->
+                        return_ok (Retry (service_error response (Some body))))
+            in
             match response with
             | Error error ->
                 retry_or_error conn ~attempt:attempt_number ~replayable error
                   attempt
-            | Ok (response, response_body) -> (
-                if Awskit.Response.is_success response then
-                  return_ok (response, response_body)
-                else
-                  let* body =
-                    read_download_body response_body ~max_size:1_048_576L
-                  in
-                  match body with
-                  | Error error -> return_error error
-                  | Ok body ->
-                      let error = service_error response (Some body) in
-                      retry_or_error conn ~attempt:attempt_number ~replayable
-                        error attempt))
+            | Ok (Done result) -> return result
+            | Ok (Retry error) ->
+                retry_or_error conn ~attempt:attempt_number ~replayable error
+                  attempt)
       in
       attempt 1
 
-    let call_empty conn ~method_ ~request ~query ~headers =
-      call conn ~method_ ~request ~query ~headers ~payload_hash:empty_hash
-        R.empty_body
+    let with_empty_response conn ~method_ ~request ~query ~headers ~f =
+      with_response conn ~method_ ~request ~query ~headers
+        ~payload_hash:empty_hash R.empty_body ~f
 
     let content_md5 body =
       Digestif.MD5.(digest_string body |> to_raw_string) |> Base64.encode_exn

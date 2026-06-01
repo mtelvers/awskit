@@ -20,7 +20,13 @@ Awskit_s3_eio.Object.put s3
 ]}
 
 Primitive uploads require a known content length. The runtime records length
-and payload hash in its upload-body descriptor before signing.
+and payload hash in its upload-body descriptor before signing. Unknown-length
+SigV4 aws-chunked streaming is not implemented today.
+
+For custom [Runtime.stream_body] uploads, declare the exact [content_length]
+and emit exactly that number of bytes. Producer callback errors are returned as
+upload failures. Prefer [Runtime.string_body] or [Runtime.bytes_body] when the
+body is already buffered.
 
 Options carry object metadata, content type, storage class, tags,
 preconditions, checksum headers, and server-side encryption headers:
@@ -77,7 +83,8 @@ service status [412] with code [PreconditionFailed]. Read [If-None-Match] and
 {2 Download}
 
 [Object.get] scopes the response body to the [consume] callback. Do not store
-the reader outside that callback.
+the reader outside that callback. Buffering helpers such as
+[Object.Buffer.get_string ~max_size] keep response-size limits explicit.
 
 {[
 let consume reader =
@@ -355,6 +362,10 @@ Awskit_s3_eio.Bucket.Encryption.put s3
     markers.}
 }
 
+[Multipart.upload_part] follows the same upload body contract as [Object.put]:
+parts require a known exact length, and custom stream producer errors are part
+of the upload result.
+
 [Multipart.Managed.upload_string] and [upload_bytes] provide a higher-level
 sequential multipart upload helper. The helper creates the upload, splits the
 body into AWS-safe parts, uploads each part, completes the upload, and attempts
@@ -494,7 +505,8 @@ returned to callers.
 Only replayable upload bodies are retried. In-memory bodies created with
 [Runtime.string_body] and [Runtime.bytes_body] are replayable. Custom stream
 bodies are retried only when their {!type:Awskit.Body.Upload.descriptor}
-marks them replayable.
+marks them replayable. Do not mark a stream replayable unless retrying can
+recreate the same bytes from the beginning.
 
 Configure retry attempts, capped exponential backoff, and jitter explicitly:
 

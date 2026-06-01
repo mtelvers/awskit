@@ -1,11 +1,28 @@
 module Runtime = struct
-  type connection = { download_body : string }
+  type connection = {
+    download_body : string;
+    mutable uploaded_body : string option;
+  }
+
   type 'a t = 'a Lwt.t
-  type upload_body = string
+
+  type upload_writer = {
+    buffer : Buffer.t;
+    fail_after_bytes : int option;
+    mutable written : int;
+  }
+
+  type upload_body =
+    | Body of Awskit.Body.Upload.descriptor * (string, Awskit_s3.Error.t) result
+    | Stream of
+        Awskit.Body.Upload.descriptor
+        * (upload_writer -> (unit, Awskit_s3.Error.t) result Lwt.t)
+
   type download_body = string
-  type upload_writer = Buffer.t
   type download_reader = { body : string; mutable offset : int }
 
+  let write_error_after_bytes = ref None
+  let reset_write_fault () = write_error_after_bytes := None
   let return = Lwt.return
   let bind = Lwt.bind
   let now _ = Ptime.epoch
@@ -20,12 +37,8 @@ module Runtime = struct
   let retry_policy _ = Awskit.Retry.default
   let sleep _ _ = Lwt.return_unit
   let s3_endpoint_config _ = Awskit_s3.default_endpoint_config
-  let empty_body = ""
-  let string_body value = value
-  let bytes_body = Bytes.to_string
-  let stream_body _descriptor ~write:_ = ""
 
-  let upload_descriptor body =
+  let descriptor_for_string body =
     {
       Awskit.Body.Upload.content_length =
         Some (Int64.of_int (String.length body));
@@ -33,9 +46,37 @@ module Runtime = struct
       replayable = true;
     }
 
+  let empty_body = Body (descriptor_for_string "", Ok "")
+  let string_body value = Body (descriptor_for_string value, Ok value)
+  let bytes_body value = string_body (Bytes.to_string value)
+  let stream_body descriptor ~write = Stream (descriptor, write)
+
+  let drain_upload_body = function
+    | Body (_, body) -> Lwt.return body
+    | Stream (_, write) ->
+        let writer =
+          {
+            buffer = Buffer.create 1024;
+            fail_after_bytes = !write_error_after_bytes;
+            written = 0;
+          }
+        in
+        Lwt.bind (write writer) (function
+          | Ok () -> Lwt.return_ok (Buffer.contents writer.buffer)
+          | Error _ as error -> Lwt.return error)
+
+  let upload_descriptor = function
+    | Body (descriptor, _) | Stream (descriptor, _) -> descriptor
+
   let write_string writer value =
-    Buffer.add_string writer value;
-    Lwt.return_ok ()
+    let length = String.length value in
+    match writer.fail_after_bytes with
+    | Some limit when writer.written + length > limit ->
+        Lwt.return_error (Awskit.Error.body "simulated upload write failure")
+    | _ ->
+        Buffer.add_string writer.buffer value;
+        writer.written <- writer.written + length;
+        Lwt.return_ok ()
 
   let read reader bytes ~off ~len =
     if len = 0 then Lwt.return_ok 0
@@ -51,7 +92,7 @@ module Runtime = struct
   let with_download_body body ~consume = consume { body; offset = 0 }
   let discard_download_body _ = Lwt.return_ok ()
 
-  let call _ _ _ =
+  let with_response _ _ _ ~f:_ =
     Lwt.return_error (Awskit.Error.transport ~retryable:false "not implemented")
 end
 
@@ -65,7 +106,19 @@ module S3 = struct
     type upload_body = Runtime.upload_body
     type download_reader = Runtime.download_reader
 
-    let put _ ~bucket:_ ~key:_ ?options:_ ~body:_ () = unsupported ()
+    let put conn ~bucket:_ ~key:_ ?options:_ ~body () =
+      Lwt.bind (Runtime.drain_upload_body body) (function
+        | Error _ as error -> Lwt.return error
+        | Ok body ->
+            conn.Runtime.uploaded_body <- Some body;
+            let request = Awskit.Response.create_exn ~status:200 () in
+            Lwt.return_ok
+              {
+                Awskit_s3.Object.Put.etag = None;
+                version_id = None;
+                checksum = None;
+                request;
+              })
 
     let get conn ~bucket:_ ~key:_ ?options:_ ~consume () =
       Lwt.bind
@@ -198,7 +251,7 @@ let test_download_to_path_creates_private_file () =
           match
             Lwt_main.run
               (Transfer.download_to_path
-                 { Runtime.download_body = body }
+                 { Runtime.download_body = body; uploaded_body = None }
                  ~bucket:"bucket" ~key:"key" ~path ())
           with
           | Error error ->
@@ -207,11 +260,70 @@ let test_download_to_path_creates_private_file () =
       let stat = Unix.stat path in
       Alcotest.(check int) "mode" 0o600 (stat.Unix.st_perm land 0o777))
 
+let write_file path body =
+  let channel = open_out_bin path in
+  Fun.protect
+    ~finally:(fun () -> close_out_noerr channel)
+    (fun () -> output_string channel body)
+
+let test_upload_from_path_streams_file_body () =
+  Runtime.reset_write_fault ();
+  let path = Filename.temp_file "awskit-upload" ".bin" in
+  let body = "first line\nsecond line\n" in
+  write_file path body;
+  Fun.protect
+    ~finally:(fun () -> remove_file path)
+    (fun () ->
+      let conn = { Runtime.download_body = ""; uploaded_body = None } in
+      let progress = ref [] in
+      match
+        Lwt_main.run
+          (Transfer.upload_from_path conn ~bucket:"bucket" ~key:"key" ~path
+             ~on_progress:(fun transferred ->
+               progress := transferred :: !progress)
+             ())
+      with
+      | Error error ->
+          Alcotest.failf "upload failed: %a" Awskit_s3.Error.pp error
+      | Ok _ ->
+          Alcotest.(check (option string))
+            "uploaded body" (Some body) conn.uploaded_body;
+          Alcotest.(check (list int64))
+            "progress"
+            [ Int64.of_int (String.length body) ]
+            (List.rev !progress))
+
+let test_upload_from_path_returns_stream_write_error () =
+  Runtime.write_error_after_bytes := Some 0;
+  let path = Filename.temp_file "awskit-upload-error" ".bin" in
+  write_file path "body that cannot be written";
+  Fun.protect
+    ~finally:(fun () ->
+      Runtime.reset_write_fault ();
+      remove_file path)
+    (fun () ->
+      let conn = { Runtime.download_body = ""; uploaded_body = None } in
+      match
+        Lwt_main.run
+          (Transfer.upload_from_path conn ~bucket:"bucket" ~key:"key" ~path ())
+      with
+      | Ok _ -> Alcotest.fail "upload succeeded despite write failure"
+      | Error error ->
+          Alcotest.(check (option string))
+            "no stored body" None conn.uploaded_body;
+          Alcotest.(check string)
+            "error" "body: simulated upload write failure"
+            (Fmt.str "%a" Awskit_s3.Error.pp error))
+
 let suite () =
   [
     ( "transfer",
       [
         Alcotest.test_case "download creates private file" `Quick
           test_download_to_path_creates_private_file;
+        Alcotest.test_case "upload streams file body" `Quick
+          test_upload_from_path_streams_file_body;
+        Alcotest.test_case "upload returns stream write error" `Quick
+          test_upload_from_path_returns_stream_write_error;
       ] );
   ]
