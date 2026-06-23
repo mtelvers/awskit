@@ -76,12 +76,13 @@ struct
         let write writer =
           try
             Eio.Path.with_open_in path (fun file ->
-                let bytes = Bytes.create buffer_size in
-                let cstruct = Cstruct.of_bytes bytes in
+                (* single_read fills the cstruct; read each chunk back out of
+                   it. *)
+                let cstruct = Cstruct.create buffer_size in
                 let rec loop transferred =
                   match Eio.Flow.single_read file cstruct with
                   | n -> (
-                      let chunk = Bytes.sub_string bytes 0 n in
+                      let chunk = Cstruct.to_string ~off:0 ~len:n cstruct in
                       match Runtime.Request_body.write_string writer chunk with
                       | Error _ as error -> error
                       | Ok () ->
